@@ -30,7 +30,8 @@ DEVICE_TYPE_MAPPING = {
     "CO2": ["co2", "carbon"],
     "Pump": ["pump"],
     "Switch": ["generic", "switch"],
-    "Fridge": ["fridge","kuehlschrank"]
+    "Fridge": ["fridge","kuehlschrank"],
+    "Camera": ["camera", "cam", "webcam", "ipcam", "cctv"]
 }
 
 # OGB ROOM DEVICE-CAPS Defintion and Mapping List
