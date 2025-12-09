@@ -36,7 +36,6 @@ class OGBIntegrationCoordinator(DataUpdateCoordinator):
             "time": [],
             "date":[],
             "text":[],
-            "camera": [],
         }
         
         self.room_selector = None  # Store the Room Selector instance

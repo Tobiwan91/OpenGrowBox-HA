@@ -14,7 +14,6 @@ from .OGBDevices.GenericSwitch import GenericSwitch
 from .OGBDevices.Pump import Pump
 from .OGBDevices.CO2 import CO2
 from .OGBDevices.Fridge import Fridge
-from .OGBDevices.Camera import Camera
 
 
 from .OGBParams.OGBParams import DEVICE_TYPE_MAPPING, CAP_MAPPING
@@ -210,8 +209,7 @@ class OGBDeviceManager:
             "Sensor": Sensor,
             "Pump": Pump,
             "C02":CO2,
-            "Fridge":Fridge,
-            "Camera":Camera
+            "Fridge":Fridge
         }
         return device_classes.get(device_type, Device)
 
