@@ -1,496 +1,478 @@
-# Camera Developer Guide - Technical Implementation
+# Camera Developer Guide - Backend Implementation
 
-## Table of Contents
+## Overview
 
-1. [Architecture Overview](#architecture-overview)
-2. [Backend Implementation](#backend-implementation)
-3. [Frontend Implementation](#frontend-implementation)
-4. [Data Flow](#data-flow)
-5. [Event System](#event-system)
-6. [API Integration](#api-integration)
-7. [Storage Management](#storage-management)
-8. [Security Considerations](#security-considerations)
+This guide covers the backend implementation of the OpenGrowBox Camera System. The system has been refactored into a modular architecture with 7 focused modules.
 
-## Architecture Overview
+For system architecture, see [CAMERA_ARCHITECTURE.md](../specialized_systems/CAMERA_ARCHITECTURE.md).
 
-### System Components
+---
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        Camera System Architecture                        │
-└─────────────────────────────────────────────────────────────────────────────────┘
+## Module Reference
 
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Frontend     │    │  Home Assistant │    │   Backend       │
-│  (React)       │◄──►│   (HA Core)    │◄──►│  (Python)       │
-│                 │    │                 │    │                 │
-│ - CameraCard    │    │ - Camera Proxy  │    │ - Camera.py    │
-│ - HLS.js       │    │ - Event Bus     │    │ - FFmpeg        │
-│ - WebSocket    │    │ - State Machine  │    │ - File I/O      │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-       │                      │                      │
-       │                      │                      │
-       └──────────────────────┴──────────────────────┘
-                    WebSocket Events
-```
+### Camera (Main Coordinator)
 
-### Technology Stack
+**File**: `Camera/__init__.py`
+**Class**: `Camera(Device)`
 
-| Component | Technology | Purpose |
-|----------|-----------|---------|
-| **Backend** | Python 3.10+ | Device logic, HA integration |
-| **Frontend** | React + Styled Components | User interface, state management |
-| **Streaming** | HLS.js | Video streaming in browser |
-| **Video Encoding** | FFmpeg | MP4 video generation |
-| **Communication** | WebSocket + HA Events | Real-time updates |
-| **Storage** | Filesystem | Image and video storage |
+The main Camera class extends the base `Device` class and serves as the coordinator for all camera functionality.
 
-## Data Flow
+**Responsibilities**:
+- Device initialization and lifecycle
+- Module instantiation and dependency injection
+- PlantsView state management callbacks
+- Internal event handling (StartTL, NeedViewPlant)
 
-### Timelapse Recording Flow
+**Key Methods**:
 
-```
-Frontend                    Backend                    HA System
-   │                           │                          │
-   │ 1. User clicks "Start"    │                          │
-   ├──────────────────────────►│                          │
-   │                           │ 2. Validate config      │
-   │                           ├──────────────────────►│
-   │                           │                          │
-   │                           │ 3. Schedule timer       │
-   │                           ├──────────────────────►│
-   │                           │                          │
-   │                           │ 4. Timer fires        │
-   │                           │                          │ 5. Capture image
-   │                           │◄───────────────────────┤
-   │◄───────────────────────────┤                          │
-   │ 6. Emit status event    │                          │
-   │◄───────────────────────────┤                          │
-   │                           │ 7. Save to disk        │
-   │                           ├──────────────────────►│
-   │                           │                          │
-   │                           │ 8. Emit update event   │
-   │                           ├──────────────────────►│
-   │◄───────────────────────────┤                          │
-   │ 9. Update UI state       │                          │
-   │                           │                          │
-   │                           │ 10. End time reached   │
-   │                           ├──────────────────────►│
-   │                           │ 11. Stop recording     │
-   │                           │                          │
-   │◄───────────────────────────┤                          │
-   │ 12. Emit complete event │                          │
-   │◄───────────────────────────┤                          │
-   │ 13. Update UI           │                          │
-```
+| Method | Purpose |
+|--------|---------|
+| `deviceInit(entitys)` | Store camera entities, set capabilities |
+| `async init()` | Initialize storage, restore state, register handlers |
+| `async startTL(resume, oldest_start_time)` | Start timelapse from plantsView config |
+| `async async_cleanup()` | Cancel all scheduled tasks on shutdown |
 
-### Daily Snapshot Flow
+**Initialization Flow**:
+1. `__init__` creates all module instances with dependency injection
+2. `deviceInit` stores entities and sets capabilities
+3. `init` hydrates state, creates directories, restores timelapses
 
-```
-Frontend                    Backend                    HA System
-   │                           │                          │
-   │ 1. User enables daily    │                          │
-   │    snapshot                │                          │
-   ├──────────────────────────►│                          │
-   │                           │ 2. Schedule next time   │
-   │                           ├──────────────────────►│
-   │                           │                          │
-   │                           │ 3. Time reached        │
-   │                           │                          │ 4. Capture with retry
-   │                           │◄───────────────────────┤
-   │◄───────────────────────────┤                          │
-   │ 5. Save to disk        │                          │
-   │                           ├──────────────────────►│
-   │                           │                          │
-   │ 6. Emit success event   │                          │
-   │                           ├──────────────────────►│
-   │◄───────────────────────────┤                          │
-   │ 7. Reschedule for       │                          │
-   │    next day               ├──────────────────────►│
-   │                           │                          │
-```
+---
 
-## Event System
+### CameraCapture
 
-### Event Naming Convention
+**File**: `Camera/capture.py`
+**Class**: `CameraCapture`
 
-**Request Events (Frontend → Backend):**
-- Prefix: `opengrowbox_`
-- Format: `opengrowbox_{action}`
-- Examples:
-  - `opengrowbox_get_timelapse_config`
-  - `opengrowbox_save_timelapse_config`
-  - `opengrowbox_start_timelapse`
-  - `opengrowbox_delete_daily_photo`
+Handles image capture from Home Assistant camera entities with retry logic.
 
-**Response Events (Backend → Frontend):**
-- No prefix (OGB internal events)
-- Format: `{ActionName}Response` or `ogb_camera_{action}`
-- Examples:
-  - `TimelapseConfigResponse`
-  - `TimelapseGenerationComplete`
-  - `ogb_camera_daily_photo_captured`
-  - `ogb_camera_capture_failed`
+**Responsibilities**:
+- Fetch images from HA camera API
+- Implement exponential backoff retry
+- Cache recent captures
+- Emit failure events
 
-### Event Payload Structure
-
-```typescript
-// Timelapse Config Request
-interface TimelapseConfigRequest {
-  event_type: 'opengrowbox_save_timelapse_config';
-  event_data: {
-    device_name: string;        // Camera entity ID
-    config: {
-      interval: string;          // Capture interval in seconds
-      startDate: string;        // ISO datetime
-      endDate: string;          // ISO datetime
-      format: 'mp4' | 'zip'; // Output format
-      daily_snapshot_enabled: boolean;
-      daily_snapshot_time: string; // HH:MM format
-    };
-  };
-}
-
-// Timelapse Config Response
-interface TimelapseConfigResponse {
-  device_name: string;
-  current_config: {
-    interval: string;
-    StartDate: string;
-    EndDate: string;
-    OutPutFormat: string;
-    daily_snapshot_enabled: boolean;
-    daily_snapshot_time: string;
-  };
-  tl_active: boolean;
-  tl_start_time: string | null;  // ISO datetime
-  tl_image_count: number;
-  available_timelapses: Array<{
-    folder: string;
-    path: string;
-    image_count: number;
-  }>;
-}
-
-// Recording Status Update
-interface CameraRecordingStatus {
-  room: string;
-  camera_entity: string;
-  is_recording: boolean;
-  is_scheduled?: boolean;
-  scheduled_start?: string;
-  image_count: number;
-  start_time: string | null;
-}
-
-// Generation Progress
-interface TimelapseGenerationProgress {
-  device_name: string;
-  progress: number;  // 0-100
-  status: 'scanning' | 'creating_zip' | 'encoding_video';
-}
-
-// Generation Complete
-interface TimelapseGenerationComplete {
-  device_name: string;
-  success: boolean;
-  output_path?: string;
-  format?: string;
-  frame_count?: number;
-  download_url?: string;
-  error?: string;
-}
-```
-
-## API Integration
-
-### Home Assistant Camera Proxy
-
-**Endpoint:** `/api/camera_proxy/{entity_id}`
-
-**Method:** GET
-
-**Headers:**
-```http
-Authorization: Bearer {token}
-```
-
-**Response:**
-- **Content-Type:** `image/jpeg` or camera-specific type
-- **Body:** Raw image bytes
-
-**Example:**
-```javascript
-const response = await fetch(`${baseUrl}/api/camera_proxy/camera.grow_room`, {
-  headers: {
-    'Authorization': `Bearer ${token}`
-  }
-});
-const blob = await response.blob();
-```
-
-### WebSocket Camera Stream
-
-**Request:**
-```javascript
-{
-  type: 'camera/stream',
-  entity_id: 'camera.grow_room'
-}
-```
-
-**Response:**
-```javascript
-{
-  url: 'http://homeassistant:8123/api/camera_proxy_stream/camera.grow_room?token=...'
-}
-```
-
-**Usage:**
-```javascript
-const streamResponse = await connection.sendMessagePromise({
-  type: 'camera/stream',
-  entity_id: selectedCamera
-});
-
-if (streamResponse && streamResponse.url) {
-  const hls = new Hls();
-  hls.loadSource(streamResponse.url);
-  hls.attachMedia(videoRef.current);
-}
-```
-
-### HA Event Bus
-
-**Firing Events:**
-```javascript
-await connection.sendMessagePromise({
-  type: 'fire_event',
-  event_type: 'opengrowbox_start_timelapse',
-  event_data: {
-    device_name: selectedCamera,
-    interval: 300,
-  },
-});
-```
-
-**Subscribing to Events:**
-```javascript
-const unsubscribe = await connection.subscribeEvents(
-  (event) => {
-    const data = event.data;
-    console.log('Received event:', data);
-    // Handle event data
-  },
-  'TimelapseGenerationComplete'
-);
-
-// Cleanup
-unsubscribe();
-```
-
-## Storage Management
-
-### Directory Structure
-
-```
-/config/ogb_data/
-└── {room_name}_img/
-    └── {camera_name}/
-        ├── daily/                    # Daily snapshots
-        │   ├── 2026-01-12_090000.jpg
-        │   ├── 2026-01-13_090001.jpg
-        │   └── ...
-        ├── timelapse/               # Timelapse source images
-        │   ├── camera_20260112_120000.jpg
-        │   ├── camera_20260112_120500.jpg
-        │   └── ...
-        └── (no output files)        # Output stored in www/
-```
-
-### Output File Location
-
-```
-/config/www/ogb_data/
-└── {room_name}_img/
-    └── timelapse_output/
-        ├── timelapse_camera_20260112_123456.mp4
-        └── timelapse_camera_20260112_123456.zip
-```
-
-**Access via:** `/local/ogb_data/{room_name}_img/timelapse_output/{filename}`
-
-### File Naming Conventions
-
-| Type | Format | Example |
-|------|---------|---------|
-| Daily Snapshot | `YYYY-MM-DD_HHMMSS.jpg` | `2026-01-12_090000.jpg` |
-| Timelapse Image | `{device_name}_YYYYMMDD_HHMMSS.jpg` | `camera_20260112_120000.jpg` |
-| Timelapse Video | `timelapse_{device_name}_{timestamp}.mp4` | `timelapse_camera_1705067056.mp4` |
-| Timelapse ZIP | `timelapse_{device_name}_{timestamp}.zip` | `timelapse_camera_1705067056.zip` |
-
-## Security Considerations
-
-### Path Traversal Protection
-
-All file operations validate paths:
-
+**Configuration**:
 ```python
-# Resolve to absolute path
-daily_path_resolved = os.path.realpath(daily_path)
-storage_path_resolved = os.path.realpath(storage_path)
-
-# Check for traversal
-if not daily_path_resolved.startswith(storage_path_resolved):
-    raise ValueError(f"Path traversal attempt detected: {daily_path}")
+DEFAULT_RETRY_DELAYS = [5, 15, 30]  # seconds
+DEFAULT_MAX_RETRIES = 3
 ```
 
-**Protected Operations:**
-- Daily photo save
-- Daily photo delete
-- ZIP file creation
-- Timelapse output operations
+**Key Methods**:
 
-### Authentication
+| Method | Purpose |
+|--------|---------|
+| `async get_ha_camera_image(entity_id)` | Single capture attempt via HA API |
+| `async capture_with_retry(entity_id, ...)` | Capture with exponential backoff |
+| `async capture_daily_snapshot(entity_id)` | Daily snapshot with retry |
+| `async capture_timelapse_image(entity_id)` | Timelapse capture with retry |
+| `get_cached_image(max_age_minutes)` | Retrieve cached image if valid |
 
-Camera access requires Home Assistant authentication:
+**Retry Pattern**:
+- Attempt 1: Immediate
+- Attempt 2: Wait 5 seconds
+- Attempt 3: Wait 15 seconds
+- Attempt 4: Wait 30 seconds
+- On failure: Emit `ogb_camera_capture_failed` event
 
-```javascript
-// Frontend token retrieval
-const getHaToken = () => {
-  // Priority 1: HomeAssistantContext accessToken
-  if (accessToken) return accessToken;
-  
-  // Priority 2: HASS entity state
-  if (HASS && HASS.states['text.ogb_accesstoken']) {
-    return HASS.states['text.ogb_accesstoken'].state;
-  }
-  
-  // Priority 3: localStorage OAuth tokens
-  const hassTokens = localStorage.getItem('hassTokens');
-  if (hassTokens) {
-    return JSON.parse(hassTokens).access_token;
-  }
-  
-  return '';
-};
-```
+---
 
-### Data Validation
+### CameraScheduler
 
-**Date Format Validation:**
+**File**: `Camera/scheduling.py`
+**Class**: `CameraScheduler`
+
+Manages timelapse and daily snapshot scheduling using Home Assistant timers.
+
+**Responsibilities**:
+- Start/stop timelapse recording
+- Schedule daily snapshots
+- Handle HA restart recovery
+- Check plant day/night cycle
+
+**Key Methods**:
+
+| Method | Purpose |
+|--------|---------|
+| `async start_timelapse(start_dt, end_dt, resume)` | Begin interval capture |
+| `async stop_timelapse(user_initiated)` | End recording, emit completion |
+| `async schedule_daily_snapshot()` | Schedule next daily capture |
+| `async restore_timelapse_after_restart()` | Resume after HA restart |
+| `async cleanup()` | Cancel all timers |
+
+**Callback Pattern**:
+The scheduler receives callbacks rather than direct references:
+- `get_plants_view` - Read state from datastore
+- `set_plants_view` - Write state to datastore
+- `capture_callback` - Trigger image capture
+- `emit_recording_status` - Emit status events
+
+**Night Mode Handling**:
 ```python
-def _parse_local_datetime(self, date_string: str) -> Optional[datetime]:
-    """Parse ISO datetime string as local time."""
-    if not date_string:
-        return None
-    
-    try:
-        naive_dt = datetime.fromisoformat(date_string)
-        now = dt_util.now()
-        local_tz = now.tzinfo
-        local_dt = naive_dt.replace(tzinfo=local_tz)
-        return dt_util.as_local(local_dt)
-    except (ValueError, AttributeError) as e:
-        _LOGGER.error(f"Failed to parse datetime '{date_string}': {e}")
-        return None
-```
+is_plant_day = self.data_store.getDeep("isPlantDay.islightON")
+capture_at_night = plants_view.get("capture_at_night", False)
 
-**Parameter Validation:**
-```python
-# Validate timelapse configuration
-if not start_dt or not end_dt:
-    await self._emit_error("invalid_datetime", "Invalid date format")
+if not is_plant_day and not capture_at_night:
+    # Skip capture, emit night mode status
+    await self._emit_recording_status(is_recording=True, is_night_mode=True)
     return
-
-# Validate interval
-try:
-    interval_sec = int(interval_str)
-    if interval_sec < 30:
-        raise ValueError("Interval must be at least 30 seconds")
-except ValueError:
-    await self._emit_error("invalid_interval", "Invalid interval format")
-```
-
-## Performance Optimization
-
-### Async File Operations
-
-Use `async_add_executor_job` for blocking I/O:
-
-```python
-# Bad: Blocking file operations
-def _delete_all_photos():
-    for filename in os.listdir(daily_path):
-        os.remove(os.path.join(daily_path, filename))
-
-# Good: Non-blocking file operations
-deleted_count = await self.hass.async_add_executor_job(_delete_all_photos)
-```
-
-### Memory Management
-
-Clean up blob URLs to prevent memory leaks:
-
-```javascript
-// Create blob URL
-const blobUrl = URL.createObjectURL(blob);
-setImageUrl(blobUrl);
-
-// Cleanup on unmount
-useEffect(() => {
-  return () => {
-    if (imageUrl) URL.revokeObjectURL(imageUrl);
-  };
-}, []);
-```
-
-### Event Cleanup
-
-Always unsubscribe from events on component unmount:
-
-```javascript
-useEffect(() => {
-  const unsubscribe = await connection.subscribeEvents(
-    (event) => { /* handle event */ },
-    'TimelapseGenerationComplete'
-  );
-  
-  return () => {
-    if (unsubscribe) unsubscribe();
-  };
-}, []);
 ```
 
 ---
 
-## Camera Developer Guide Summary
+### CameraStorage
 
-**Camera system documented!** Complete technical implementation reference.
+**File**: `Camera/storage.py`
+**Class**: `CameraStorage`
 
-**Backend Implementation:**
-- ✅ **Camera Class**: Full Python class structure
-- ✅ **Image Capture**: HA camera proxy integration
-- ✅ **Timelapse Recording**: Interval-based capture with scheduling
-- ✅ **Daily Snapshots**: Scheduled capture with retry logic
-- ✅ **Video Generation**: FFmpeg MP4 and ZIP archive creation
-- ✅ **Storage Management**: Path-validated file operations
-- ✅ **Event System**: HA event bus integration
+Handles all file I/O operations with path validation and executor wrapping.
 
-**Frontend Implementation:**
-- ✅ **React Component**: Complete component structure
-- ✅ **Live Streaming**: HLS.js integration with fallback
-- ✅ **State Management**: React hooks for all camera features
-- ✅ **Event Subscriptions**: WebSocket event handling
-- ✅ **UI Components**: Styled components for camera interface
-- ✅ **Error Handling**: User-friendly error messages
+**Responsibilities**:
+- Directory management and creation
+- Image save/delete operations
+- ZIP file creation
+- Path traversal protection
+- State hydration from disk
 
-**API Integration:**
-- ✅ **Camera Proxy**: HA camera proxy API
-- ✅ **WebSocket**: Real-time camera streaming
-- ✅ **Event Bus**: HA event fire/subscribe
-- ✅ **Authentication**: Token-based access control
+**Path Methods**:
 
-**For user-facing documentation, see [Camera User Guide](../user_guides/CAMERA_USER_GUIDE.md)**
-**For system architecture, see [Architecture Guide](../getting_started/ARCHITECTURE.md)**
-**For device management, see [Device Management Guide](../device_management/device_management.md)**
+| Method | Returns |
+|--------|---------|
+| `get_base_path()` | `/config/ogb_data/{room}_img/{camera}` |
+| `get_daily_path()` | `{base}/daily` |
+| `get_timelapse_path()` | `{base}/timelapse` |
+| `get_output_path()` | `/config/www/ogb_data/{room}_img/timelapse_output` |
+
+**Path Validation Pattern**:
+```python
+def validate_storage_path(self, subdirectory, base_path=None):
+    target_path = os.path.join(storage_path, subdirectory)
+    target_path_resolved = os.path.realpath(target_path)
+    storage_path_resolved = os.path.realpath(storage_path)
+
+    if not target_path_resolved.startswith(storage_path_resolved):
+        raise ValueError(f"Path traversal attempt detected: {target_path}")
+```
+
+**Executor Wrapping Pattern**:
+```python
+async def save_image(self, path, image_data):
+    await self.hass.async_add_executor_job(
+        self._sync_save_image, path, image_data
+    )
+```
+
+**Key Methods**:
+
+| Method | Purpose |
+|--------|---------|
+| `async initialize_storage_paths()` | Create directories on startup |
+| `async save_image(path, image_data)` | Save base64 image to disk |
+| `async save_daily_photo(image_data)` | Save with YYYY-MM-DD_HHMMSS.jpg naming |
+| `async delete_all_photos_in_directory(path)` | Bulk delete with validation |
+| `async hydrate_plants_view_from_disk(callback)` | Load state from JSON file |
+
+---
+
+### VideoGenerator
+
+**File**: `Camera/video_generator.py`
+**Class**: `VideoGenerator`
+
+Creates timelapse videos using FFmpeg with hardware acceleration detection.
+
+**Responsibilities**:
+- Scan timelapse directory for images
+- Detect hardware acceleration (VAAPI, NVENC, V4L2)
+- Generate MP4 videos with FFmpeg
+- Create ZIP archives
+- Track and emit generation progress
+
+**Hardware Acceleration Priority**:
+1. V4L2 M2M (Raspberry Pi)
+2. VAAPI (Intel/AMD)
+3. NVENC (NVIDIA)
+4. Software encoding (libx264 fallback)
+
+**Memory-Aware Limits**:
+```python
+def _get_max_file_size(self):
+    # Try psutil first
+    mem = psutil.virtual_memory()
+    max_mb = int(mem.available * 0.7)  # 70% of available
+
+    # Fallback to /proc/meminfo
+    # Final fallback: 200MB default
+```
+
+**Dynamic FPS Calculation**:
+```python
+if num_images <= 10: fps = 2
+elif num_images <= 20: fps = 3
+elif num_images <= 30: fps = 4
+else: fps = 6
+```
+
+**Key Methods**:
+
+| Method | Purpose |
+|--------|---------|
+| `detect_hardware_acceleration()` | Return (encoder, pix_fmt, extra_params) |
+| `async generate_timelapse_video(...)` | Main generation entry point |
+| `async handle_generate_timelapse(event, ...)` | Event handler wrapper |
+| `async cancel_generation()` | Abort active generation |
+
+**Progress Tracking**:
+- Emit `TimelapseGenerationProgress` events during generation
+- Status values: `scanning`, `preparing`, `creating_zip`, `encoding_video`, `complete`, `error`
+- Progress: 0-100 percentage
+
+---
+
+### CameraEventHandlers
+
+**File**: `Camera/handlers.py`
+**Class**: `CameraEventHandlers`
+
+Routes Home Assistant bus events to appropriate module methods.
+
+**Responsibilities**:
+- Register HA bus listeners
+- Validate device targeting
+- Route events to handlers
+- Emit response events
+
+**Event Registration**:
+```python
+def register_all(self):
+    self.hass.bus.async_listen("opengrowbox_get_timelapse_config", handler)
+    self.hass.bus.async_listen("opengrowbox_save_timelapse_config", handler)
+    self.hass.bus.async_listen("opengrowbox_generate_timelapse", handler)
+    # ... more events
+```
+
+**Device Targeting Pattern**:
+```python
+def _is_device_for_event(self, device_name):
+    normalized = str(device_name).strip().lower()
+    return normalized in {
+        self.device_name.lower(),
+        self.camera_entity_id.lower(),
+        f"camera.{self.device_name}".lower(),
+    }
+```
+
+**Handled Events**:
+
+| Event | Handler Method |
+|-------|----------------|
+| `opengrowbox_get_timelapse_config` | `_handle_get_timelapse_config` |
+| `opengrowbox_save_timelapse_config` | `_handle_save_timelapse_config` |
+| `opengrowbox_generate_timelapse` | `_handle_generate_timelapse` |
+| `opengrowbox_start_timelapse` | `_handle_start_timelapse` |
+| `opengrowbox_stop_timelapse` | `_handle_stop_timelapse` |
+| `opengrowbox_get_daily_photos` | `_handle_get_daily_photos` |
+| `opengrowbox_get_daily_photo` | `_handle_get_daily_photo` |
+| `opengrowbox_delete_daily_photo` | `_handle_delete_daily_photo` |
+| `opengrowbox_delete_all_daily` | `_handle_delete_all_daily` |
+| `opengrowbox_download_daily_zip` | `_handle_download_daily_zip` |
+| `opengrowbox_delete_all_timelapse` | `_handle_delete_all_timelapse` |
+| `opengrowbox_delete_all_timelapse_output` | `_handle_delete_all_timelapse_output` |
+| `opengrowbox_get_timelapse_photos` | `_handle_get_timelapse_photos` |
+| `opengrowbox_user_needs_image` | `_handle_user_needs_image` |
+
+---
+
+### Utils (Pure Functions)
+
+**File**: `Camera/utils.py`
+
+Pure utility functions with no class dependencies. Easily testable in isolation.
+
+**Functions**:
+
+| Function | Purpose |
+|----------|---------|
+| `parse_datetime_value(value)` | Parse ISO datetime strings to timezone-aware datetime |
+| `to_storage_iso(dt_value)` | Serialize datetime to UTC ISO with Z suffix |
+| `sanitize_filename_part(value, fallback)` | Convert text to filesystem-safe filename |
+
+**DateTime Parsing**:
+- Handles ISO format with Z suffix
+- Fixes malformed legacy strings (e.g., `+00:00Z`)
+- Falls back to legacy localized formats
+
+---
+
+## Event System
+
+### Events Emitted (Backend → Frontend)
+
+| Event | When | Payload Keys |
+|-------|------|--------------|
+| `TimelapseConfigResponse` | Config requested | `current_config`, `tl_active`, `tl_image_count` |
+| `TimelapseConfigSaved` | Config updated | `config` |
+| `TimelapseGenerationStarted` | Generation begins | `start_date`, `end_date`, `format` |
+| `TimelapseGenerationProgress` | During generation | `progress`, `status`, `file_count` |
+| `TimelapseGenerationComplete` | Generation done | `success`, `download_url`, `file_size` |
+| `CameraRecordingStatus` | Recording state change | `is_recording`, `image_count`, `is_night_mode` |
+| `TimelapseCompleted` | Recording ended | `total_images`, `duration`, `user_initiated` |
+| `DailyPhotosResponse` | Photos listed | `photos`, `count`, `storage_path` |
+| `DailyPhotoResponse` | Single photo | `image_data`, `date`, `filename` |
+| `DailyZipResponse` | ZIP created | `download_url`, `photo_count`, `total_size` |
+| `ogb_camera_capture_failed` | Capture error | `error`, `retry_count`, `capture_type` |
+| `ogb_camera_daily_photo_captured` | Daily success | `date`, `filename`, `path` |
+| `ogb_camera_photo_deleted` | Photo deleted | `date`, `filename` |
+| `ogb_camera_all_daily_deleted` | Bulk delete | `deleted_count` |
+
+### Events Received (Frontend → Backend)
+
+All received events use the `opengrowbox_` prefix.
+
+---
+
+## DataStore Integration
+
+### PlantsView Structure
+
+Camera state is stored in the room's datastore under `plantsView`:
+
+```
+plantsView: {
+    isTimeLapseActive: boolean,
+    TimeLapseIntervall: string,      // "300", "600", etc.
+    StartDate: string,               // "2026-03-29T12:00:00Z"
+    EndDate: string,                 // "2026-04-15T12:00:00Z"
+    OutPutFormat: "mp4" | "zip",
+    tl_image_count: number,
+    daily_snapshot_enabled: boolean,
+    daily_snapshot_time: string,     // "09:00"
+    capture_at_night: boolean
+}
+```
+
+### State Persistence
+
+The camera system triggers state saves via the `SaveState` event:
+
+```python
+await self.event_manager.emit("SaveState", {
+    "source": "Camera",
+    "device": self.device_name,
+    "action": "start_recording"  # or "stop_recording", etc.
+})
+```
+
+---
+
+## Error Handling Patterns
+
+### Capture Failure Handling
+
+```python
+if not image_data:
+    await self.event_manager.emit("ogb_camera_capture_failed", {
+        "device": self.device_name,
+        "room": self.in_room,
+        "error": f"Failed after {max_retries} retry attempts",
+        "retry_count": max_retries,
+        "capture_type": "daily" | "timelapse",
+    }, haEvent=True)
+```
+
+### Path Validation
+
+```python
+try:
+    target_path, target_resolved, storage_path, storage_resolved = \
+        self.validate_storage_path("daily")
+except ValueError as e:
+    _LOGGER.error(f"Path validation failed: {e}")
+    return {"success": False, "reason": "Path validation failed"}
+```
+
+### Generation Error Recovery
+
+```python
+try:
+    # Generation logic
+except Exception as e:
+    self.generation_status = "error"
+    await self.event_manager.emit("TimelapseGenerationComplete", {
+        "device_name": camera_entity_id,
+        "success": False,
+        "error": str(e),
+    }, haEvent=True)
+finally:
+    self.generation_active = False
+```
+
+---
+
+## Testing Guide
+
+### Unit Testing Utils
+
+The `utils.py` module contains pure functions that are easily testable:
+
+```python
+# Test datetime parsing
+result = parse_datetime_value("2026-03-29T12:00:00Z")
+assert result.tzinfo is not None
+
+# Test filename sanitization
+result = sanitize_filename_part("Blue Dream #1!")
+assert result == "blue_dream_1"
+```
+
+### Integration Testing
+
+Key integration points to test:
+
+1. **Capture Flow**: Mock HA camera API, verify retry logic
+2. **Scheduling**: Use `asyncio` time mocking for timer tests
+3. **Storage**: Use temp directories, verify path validation
+4. **Events**: Subscribe to events, verify payloads
+
+### Manual Testing Checklist
+
+- [ ] Live streaming displays in CameraCard
+- [ ] Daily snapshot creates file at scheduled time
+- [ ] Timelapse captures at configured interval
+- [ ] Night mode skips captures when expected
+- [ ] Video generation completes with progress events
+- [ ] HA restart resumes active timelapses
+- [ ] Cleanup cancels all scheduled tasks
+
+---
+
+## Debugging
+
+### Enable Debug Logging
+
+```yaml
+# configuration.yaml
+logger:
+  logs:
+    custom_components.opengrowbox.OGBController.OGBDevices.Camera: debug
+```
+
+### Key Log Points
+
+| Module | Log Message | Meaning |
+|--------|-------------|---------|
+| Camera | `Camera initialized (storage: ...)` | Startup complete |
+| Capture | `Captured successfully (attempt N)` | Retry working |
+| Scheduler | `Timelapse capture started` | Recording active |
+| Storage | `Path traversal attempt detected` | Security issue |
+| VideoGenerator | `Detected VAAPI/NVENC/V4L2` | Hardware accel |
+| Handlers | `Sent timelapse config` | Event handled |
+
+---
+
+## Related Documentation
+
+- **Architecture**: [CAMERA_ARCHITECTURE.md](../specialized_systems/CAMERA_ARCHITECTURE.md)
+- **User Guide**: [CAMERA_USER_GUIDE.md](../device_management/CAMERA_USER_GUIDE.md)
+- **Frontend Integration**: [CAMERA_FRONTEND_INTEGRATION.md](CAMERA_FRONTEND_INTEGRATION.md)
+- **Quick Reference**: [CAMERA_QUICK_REFERENCE.md](../device_management/CAMERA_QUICK_REFERENCE.md)
